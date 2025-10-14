@@ -1,0 +1,71 @@
+services:
+  # === FRONTEND (Next.js) ===
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: mosaic-app
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - GATEWAY_URL=http://gateway:9080
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
+    depends_on:
+      - gateway
+    volumes:
+      - ./app:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run dev -- -H 0.0.0.0 -p 3000
+
+  # === GATEWAY (Express) ===
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: mosaic-gateway
+    environment:
+      - PORT=9080
+      - WORKER_CLUSTER_URL=http://color-cluster:8082
+      - WORKER_CELLS_URL=http://cell-mapper:8083
+      - NODE_ENV=development
+    depends_on:
+      - color-cluster
+      - cell-mapper
+    volumes:
+      - ./gateway:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run dev
+
+  # === COLOR CLUSTER WORKER ===
+  color-cluster:
+    build:
+      context: ./workers/color-cluster
+      dockerfile: Dockerfile
+    container_name: mosaic-color-cluster
+    ports:
+      - "18082:8082"   # внешний порт на хосте → внутренний в контейнере
+    environment:
+      - PORT=8082
+      - NODE_ENV=development
+    volumes:
+      - ./workers/color-cluster:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run dev
+
+  # === CELL MAPPER WORKER ===
+  cell-mapper:
+    build:
+      context: ./workers/cell-mapper
+      dockerfile: Dockerfile
+    container_name: mosaic-cell-mapper
+    ports:
+      - "18083:8083"
+    environment:
+      - PORT=8083
+      - NODE_ENV=development
+    volumes:
+      - ./workers/cell-mapper:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run dev

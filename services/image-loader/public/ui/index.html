@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Mosaic — Image Loader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+    .section { border:1px solid #ddd; padding:12px; border-radius:10px; margin-bottom:14px; }
+    .hidden { display:none; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap:10px; }
+    .card { border:1px solid #eee; border-radius:10px; padding:8px; display:flex; flex-direction:column; gap:6px; }
+    .thumb { width:100%; height:160px; object-fit:contain; background:#fafafa; border:1px solid #f0f0f0; border-radius:8px; }
+    #dropzone { border:2px dashed #bbb; border-radius:10px; padding:18px; text-align:center; color:#666; }
+    #dropzone.dragover { border-color:#3b82f6; background:#f0f7ff; color:#1d4ed8; }
+    button { padding:8px 12px; border-radius:8px; border:1px solid #ddd; background:#fff; cursor:pointer; }
+    button:hover { background:#f6f6f6; }
+    input[type="number"], input[type="text"], select { padding:6px 8px; border:1px solid #ddd; border-radius:8px; }
+    img#adminPreview { max-width:100%; image-rendering: pixelated; border:1px solid #eee; }
+  </style>
+</head>
+<body>
+
+  <h1>Mosaic — загрузка и галереи</h1>
+  
+  <div class="toolbar section">
+    <div id="dropzone">Перетащи файл сюда или выбери ниже</div>
+    <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+      <input type="file" id="fileInput" />
+      <button id="btnUpload">Загрузить файл</button>
+    </div>
+    <pre id="uploadLog" style="white-space:pre-wrap; font-size:12px; margin:0; padding:0;"></pre>
+  </div>
+
+  <div class="toolbar" style="margin-bottom:8px;">
+    <button id="btnShowGallery">Показать/скрыть «Загруженные»</button>
+    <button id="btnClearGallery">Очистить «Загруженные»</button>
+    <button id="btnShowInternal">Открыть/закрыть внутреннюю галерею</button>
+    <button id="btnImportSelected" class="hidden">Загрузить выбранные</button>
+  </div>
+
+  <!-- Загруженные -->
+  <section id="gallerySection" class="section">
+    <h3>Галерея «Загруженные»</h3>
+    <div id="gallery" class="grid"></div>
+  </section>
+
+  <!-- Внутренняя галерея -->
+  <section id="internalSection" class="section hidden">
+    <h3>Внутренняя галерея (демо)</h3>
+    <div id="internalGallery" class="grid"></div>
+  </section>
+
+  <!-- User панель: параметры полотна (перенесена рядом с Admin) -->
+<section id="userPanel" class="section" style="margin-top:10px;">
+  <h3>Параметры полотна (User)</h3>
+  <div style="display:grid;grid-template-columns:repeat(6,minmax(160px,1fr));gap:10px;">
+    <div>
+      <div><b>Единицы</b></div>
+      <select id="userUnits">
+        <option value="px" selected>px</option>
+        <option value="mm">mm + DPI</option>
+      </select>
+    </div>
+    <div>
+      <div><b>Ширина</b></div>
+      <input id="userW" type="number" min="1" value="1200" style="width:100%;">
+    </div>
+    <div>
+      <div><b>Высота</b></div>
+      <input id="userH" type="number" min="1" value="900" style="width:100%;">
+    </div>
+    <div id="userDpiBox" class="hidden">
+      <div><b>DPI</b></div>
+      <input id="userDpi" type="number" min="30" value="300" style="width:100%;">
+    </div>
+    <div>
+      <div><b>Fit</b></div>
+      <select id="userFit">
+        <option value="contain" selected>contain</option>
+        <option value="cover">cover</option>
+        <option value="fill">fill</option>
+        <option value="inside">inside</option>
+        <option value="outside">outside</option>
+      </select>
+    </div>
+    <div>
+      <div><b>Фон (hex)</b></div>
+      <input id="userBg" type="text" value="#ffffff" style="width:100%;">
+    </div>
+    <div style="display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;">
+      <button id="btnUserSave">Сохранить параметры</button>
+      <button id="btnExportProject">Экспорт .mosaic</button>
+      <button id="btnTestExport">Проверить экспорт API</button>
+    </div>
+  </div>
+  <small id="userSavedNote" class="hidden">Параметры сохранены</small>
+</section>
+
+  <!-- Admin-only panel (предпросмотр масштабирования) -->
+  <section id="adminPanel" class="section">
+    <label style="display:inline-flex;align-items:center;gap:8px;">
+      <input type="checkbox" id="adminToggle"> Режим Admin (предпросмотр растянутой картинки)
+    </label>
+
+    <div id="adminControls" class="hidden" style="margin-top:12px; display:grid; grid-template-columns: repeat(6, minmax(160px,1fr)); gap:10px;">
+      <div>
+        <div><b>Источник</b></div>
+        <div id="selectedIdBox" style="word-break:break-all;">не выбрано (кликни карточку в «Загруженных»)</div>
+      </div>
+      <div>
+        <div><b>Единицы</b></div>
+        <select id="units">
+          <option value="px" selected>px</option>
+          <option value="mm">mm + DPI</option>
+        </select>
+      </div>
+      <div>
+        <div><b>Ширина</b></div>
+        <input id="targetW" type="number" min="1" value="1200" style="width:100%;">
+      </div>
+      <div>
+        <div><b>Высота</b></div>
+        <input id="targetH" type="number" min="1" value="900" style="width:100%;">
+      </div>
+      <div id="dpiBox" class="hidden">
+        <div><b>DPI</b></div>
+        <input id="dpi" type="number" min="30" value="300" style="width:100%;">
+      </div>
+      <div>
+        <div><b>Fit</b></div>
+        <select id="fit">
+          <option value="contain" selected>contain</option>
+          <option value="cover">cover</option>
+          <option value="fill">fill (деформация)</option>
+          <option value="inside">inside</option>
+          <option value="outside">outside</option>
+        </select>
+      </div>
+      <div>
+        <div><b>Фон (hex)</b></div>
+        <input id="bg" type="text" value="#ffffff" style="width:100%;">
+      </div>
+      <div>
+        <div><b>Формат</b></div>
+        <select id="fmt">
+          <option value="png">png</option>
+          <option value="jpeg" selected>jpeg</option>
+          <option value="webp">webp</option>
+        </select>
+      </div>
+      <div>
+        <div><b>Качество</b></div>
+        <input id="quality" type="number" min="1" max="100" value="92" style="width:100%;">
+      </div>
+      <div>
+        <div><b>Пиксельное ядро</b></div>
+        <select id="kernel">
+          <option value="nearest" selected>nearest (пиксели)</option>
+          <option value="lanczos3">lanczos3 (сглажено)</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:flex-end;">
+        <button id="btnAdminPreview">Сформировать предпросмотр</button>
+      </div>
+    </div>
+
+    <div id="adminOutput" class="hidden" style="margin-top:12px;">
+      <div><b>Предпросмотр (Admin):</b></div>
+      <img id="adminPreview" />
+    </div>
+  </section>
+
+  <script src="/ui/script.js"></script>
+</body>
+</html>

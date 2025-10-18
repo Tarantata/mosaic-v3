@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     container_name: mosaic-app
     ports:
-      - "3000:3000"
+      - '3000:3000'
     environment:
       - NODE_ENV=development
       - GATEWAY_URL=http://gateway:9080
@@ -45,7 +45,7 @@ services:
       dockerfile: Dockerfile
     container_name: mosaic-color-cluster
     ports:
-      - "18082:8082"   # внешний порт на хосте → внутренний в контейнере
+      - '18082:8082' # внешний порт на хосте → внутренний в контейнере
     environment:
       - PORT=8082
       - NODE_ENV=development
@@ -61,7 +61,7 @@ services:
       dockerfile: Dockerfile
     container_name: mosaic-cell-mapper
     ports:
-      - "18083:8083"
+      - '18083:8083'
     environment:
       - PORT=8083
       - NODE_ENV=development
@@ -69,3 +69,52 @@ services:
       - ./workers/cell-mapper:/usr/src/app
       - /usr/src/app/node_modules
     command: npm run dev
+
+  # === DATABASE (MongoDB) ===
+  mongo:
+    image: mongo:7
+    container_name: mosaic-mongo
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo_data:/data/db
+
+  # === IMAGE LOADER ===
+  image-loader:
+    build: ./services/image-loader
+    container_name: mosaic-image-loader
+    environment:
+      - INTERNAL_GALLERY_DIR=/internal-gallery
+      - SERVICE_NAME=image-loader
+      - PORT=3001
+      - MONGO_URL=mongodb://mongo:27017/mosaic
+      - SCALER_URL=http://scaler:3002
+      - DATA_DIR=/data/images
+      - THUMB_DIR=/data/thumbs
+    depends_on:
+      - mongo
+    ports:
+      - '3001:3001'
+    volumes:
+      - ./data/images:/data/images
+      - ./data/thumbs:/data/thumbs
+      - ./internal-gallery:/internal-gallery 
+      - ./services/image-loader/public:/app/public
+
+  # === SCALER ===
+  scaler:
+    build:
+      context: ./services/scaler
+    container_name: mosaic-scaler
+    environment:
+      - SERVICE_NAME=scaler
+      - PORT=3002
+      - IMAGE_LOADER_URL=http://image-loader:3001
+    depends_on:
+      - mongo
+    ports:
+      - '3002:3002'
+
+volumes:
+  mongo_data:

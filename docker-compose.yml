@@ -112,7 +112,7 @@ services:
       - PORT=3002
       - IMAGE_LOADER_URL=http://image-loader:3001
     depends_on:
-      - mongo
+      - image-loader
     ports:
       - '3002:3002'
 

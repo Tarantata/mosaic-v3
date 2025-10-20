@@ -6,7 +6,7 @@ import path from 'path';
 import fs from 'fs';
 import sharp from 'sharp';
 import archiver from 'archiver';
-import { connectDB, ImageModel } from './db.js';
+import { connectDB, ImageModel, CanvasModel } from './db.js';
 import { saveFile, makeThumb, getFilePath, ensureDirs } from './storage.js';
 import { fileURLToPath } from 'url';
 import { CONFIG } from './config.js';
@@ -34,6 +34,8 @@ app.use('/ui', express.static(CONFIG.PATHS.uiDir, {
   index: 'index.html',
   extensions: ['html']
 }));
+
+connectDB().catch(err => console.error('[image-loader] connectDB failed', err));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -233,6 +235,18 @@ app.get('/images/:id/:kind', async (req, res) => {
   }
 });
 
+app.get('/project/canvas', asyncWrap(async (req, res) => {
+  await connectDB();
+
+  const id = String(req.query.id || '').trim();
+  if (!id) return res.status(400).json({ error: 'id required' });
+
+  const found = await CanvasModel.findOne({ imageId: id }).lean();
+  if (!found) return res.json({ id, canvas: null, updatedAt: null });
+
+  res.json({ id, canvas: found.params || null, updatedAt: found.updatedAt || null });
+}));
+
 // Raw by filename (optional)
 app.get('/file/:filename', (req, res) => {
   try {
@@ -281,6 +295,39 @@ app.post('/proxy-scale-by-mm', async (req, res) => {
     res.status(500).json({ error: e?.message || String(e) });
   }
 });
+
+app.post('/project/save-canvas', asyncWrap(async (req, res) => {
+  await connectDB();
+
+  const body = req.body || {};
+  const id = String(body.id || '').trim();
+  const canvas = body.canvas || {};
+
+  if (!id) return res.status(400).json({ error: 'id required' });
+
+  const units = (canvas.units === 'mm') ? 'mm' : 'px';
+  const width = Number(canvas.width || 0);
+  const height = Number(canvas.height || 0);
+  const dpi = units === 'mm' ? Number(canvas.dpi || 300) : undefined;
+
+  const fitOptions = ['contain','cover','fill','inside','outside'] as const;
+  const fit = fitOptions.includes(canvas.fit) ? canvas.fit : 'contain';
+  const background = String(canvas.background || '#ffffff');
+
+  if (!width || !height) {
+    return res.status(400).json({ error: 'canvas.width and canvas.height required' });
+  }
+
+  const doc = {
+    imageId: id,
+    params: { units, width, height, dpi, fit, background },
+    updatedAt: new Date()
+  };
+
+  await CanvasModel.updateOne({ imageId: id }, { $set: doc }, { upsert: true });
+  res.json({ ok: true, id, canvas: doc.params, updatedAt: doc.updatedAt });
+}));
+
 
 /**
  * Экспорт проекта в .mosaic (ZIP)

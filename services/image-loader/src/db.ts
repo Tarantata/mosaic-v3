@@ -19,3 +19,21 @@ const ImageSchema = new mongoose.Schema({
 });
 
 export const ImageModel = mongoose.model('images', ImageSchema);
+
+// === Canvas Settings Model ===
+
+const CanvasSchema = new mongoose.Schema({
+  imageId: { type: String, required: true, unique: true },
+  params: {
+    units: { type: String, enum: ['px', 'mm'], default: 'px' },
+    width: Number,
+    height: Number,
+    dpi: Number,
+    fit: { type: String, enum: ['contain', 'cover', 'fill', 'inside', 'outside'], default: 'contain' },
+    background: String,
+  },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+export const CanvasModel = mongoose.model('canvas_settings', CanvasSchema);
+

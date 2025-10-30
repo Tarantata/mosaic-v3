@@ -35,6 +35,9 @@ app.use('/ui', express.static(CONFIG.PATHS.uiDir, {
   extensions: ['html']
 }));
 
+// ВАЖНО: /app/public примонтирован, поэтому используем процессную папку
+app.use('/internal-gallery', express.static(path.resolve(process.cwd(), 'public/internal-gallery')));
+
 connectDB().catch(err => console.error('[image-loader] connectDB failed', err));
 
 const upload = multer({
@@ -53,14 +56,23 @@ app.get('/health', (_req, res) =>
 
 app.get('/internal-gallery/list', async (_req, res) => {
   try {
-    if (!fs.existsSync(INTERNAL_GALLERY_DIR)) return res.json([]);
-    const files = await fs.promises.readdir(INTERNAL_GALLERY_DIR);
-    const list = files
-      .filter(f => ALLOWED_EXT.includes(path.extname(f).toLowerCase()))
-      .map(f => ({ name: f, url: `/internal-gallery/file/${encodeURIComponent(f)}` }));
-    res.json(list);
+    const dir = path.resolve(process.cwd(), 'public/internal-gallery');
+    const allow = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']); // регистронезависим
+    let entries: string[] = [];
+    try {
+      entries = await fs.promises.readdir(dir);
+    } catch {
+      return res.json([]); // если папки нет — пусто (не 500)
+    }
+    const items = entries
+      .filter(n => allow.has(path.extname(n).toLowerCase()))
+      .map(name => ({
+        name,
+        url: `/internal-gallery/${encodeURIComponent(name)}`
+      }));
+    res.json(items);
   } catch (e: any) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
@@ -109,90 +121,99 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 });
 
 // Импорт из внутренней галереи в проект (как будто загрузили)
-// НОВАЯ, БОЛЕЕ НАДЁЖНАЯ ВЕРСИЯ: нормализуем вход в PNG (поддержка "капризных" GIF/JPEG)
 app.post('/internal-gallery/import', async (req, res) => {
   try {
-    const { name } = req.query; // /internal-gallery/import?name=foo.png
-    if (!name || typeof name !== 'string') {
-      return res.status(400).json({ error: 'name required' });
-    }
-    const srcPath = path.join(INTERNAL_GALLERY_DIR, name);
-    if (!fs.existsSync(srcPath)) {
-      return res.status(404).json({ error: 'file not found' });
-    }
-
     await connectDB();
-    ensureDirs();
 
-    // 1) Читаем как буфер
-    const srcBuf = await fs.promises.readFile(srcPath);
+    const name = String(req.query.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name required' });
 
-    // 2) Пытаемся декодировать через sharp; если формат «капризный», делаем нормализацию
-    let normalizedBuf: Buffer;
-    let outExt = '.png';
-    let outMime = 'image/png';
-    try {
-      // пробуем декодировать «как есть»
-      await sharp(srcBuf, { animated: true, limitInputPixels: false }).metadata();
-      // и сразу нормализуем в PNG (универсально)
-      normalizedBuf = await sharp(srcBuf, { animated: true, limitInputPixels: false })
-        .png()
-        .toBuffer();
-    } catch (e) {
-      // некоторые форматы/файлы могут падать — попробуем ещё раз "мягко" через перезапись в PNG
-      try {
-        normalizedBuf = await sharp(srcBuf, { limitInputPixels: false })
-          .png()
-          .toBuffer();
-      } catch (e2: any) {
-        return res.status(415).json({ error: `Unsupported image: ${name}` });
-      }
+    // Берём файл из public/internal-gallery (рабочая папка контейнера)
+    const srcDir  = path.resolve(process.cwd(), 'public/internal-gallery');
+    const srcPath = path.join(srcDir, name);
+    if (!fs.existsSync(srcPath)) {
+      return res.status(404).json({ error: 'file not found', name, srcPath });
     }
 
-    // 3) Имя файла в хранилище — всегда .png после нормализации
-    const filename = `${Date.now()}_${Math.random().toString(16).slice(2)}${outExt}`;
-    const savedPath = await saveFile(normalizedBuf, filename);
+    // Читаем и получаем метаданные
+    const input = await fs.promises.readFile(srcPath);
+    const meta  = await sharp(input).metadata();
+    const mime  = (meta.format === 'png')  ? 'image/png'
+                : (meta.format === 'jpeg') ? 'image/jpeg'
+                : (meta.format === 'webp') ? 'image/webp'
+                : (meta.format === 'gif')  ? 'image/gif'
+                : 'application/octet-stream';
 
-    // 4) Метаданные и превью
-    const meta = await sharp(savedPath).metadata();
-    const { thumbName } = await makeThumb(savedPath, filename); // makeThumb пусть так же пишет PNG-превью
+    // Генерация имён и каталогов
+    const ts   = Date.now();
+    const base = `${ts}_${Math.random().toString(16).slice(2, 10)}`;
+    const outDir   = path.resolve(process.cwd(), 'uploads');
+    const thumbsDir= path.resolve(process.cwd(), 'public', 'thumbs');
+    await fs.promises.mkdir(outDir,    { recursive: true });
+    await fs.promises.mkdir(thumbsDir, { recursive: true });
 
-    // 5) Сохраняем запись в БД
+    const outName   = `${base}${path.extname(name).toLowerCase() || '.jpg'}`;
+    const thumbName = `${base}_thumb.jpg`;
+    const outPath   = path.join(outDir, outName);
+    const thumbPath = path.join(thumbsDir, thumbName);
+
+    // Записываем оригинал
+    await fs.promises.writeFile(outPath, input);
+
+    // Делаем превью
+    await sharp(input).resize(300, 300, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toFile(thumbPath);
+
+    // Сохраняем в БД
     const doc = await ImageModel.create({
       originalName: name,
-      filename,
-      mime: outMime,
-      size: normalizedBuf.length,
-      width: meta.width ?? null,
-      height: meta.height ?? null,
-      thumb: thumbName,
+      filename: outName,
+      mime,
+      size: input.length,
+      width:  meta.width  || null,
+      height: meta.height || null,
+      thumb: thumbName
     });
 
-    return res.status(201).json({
+    res.json({
       id: String(doc._id),
-      filename,
+      filename: outName,
       thumb: thumbName,
       width: doc.width,
-      height: doc.height
+      height: doc.height,
+      mime
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e.message });
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
 // List images (gallery)
-app.get('/images', async (_req, res) => {
-  try {
-    await connectDB();
-    const list = await ImageModel.find(
-      {},
-      { originalName: 1, filename: 1, thumb: 1, width: 1, height: 1, mime: 1, size: 1, createdAt: 1 }
-    ).sort({ createdAt: -1 }).limit(200);
-    res.json(list);
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
+app.get('/images', asyncWrap(async (req, res) => {
+  const page  = Math.max(1, Number(req.query.page || 1));
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 12)));
+  const q     = String(req.query.q || '').trim();
+  const mime  = String(req.query.mime || '').trim();
+  
+  const sort  = (req.query.sort === 'oldest')
+  ? ({ createdAt: 1 as const })
+  : ({ createdAt: -1 as const });
+
+  const filter: any = {};
+  if (q)   filter.$text = { $search: q };
+  if (mime) filter.mime = mime;
+
+  const total = await ImageModel.countDocuments(filter);
+  const items = await ImageModel
+    .find(filter)
+    .sort(sort)
+    .skip((page - 1) * limit)
+    .limit(limit)
+    .lean();
+
+  res.json({ items, page, pages: Math.ceil(total / limit), total });
+}));
 
 // Очистить все загруженные изображения (dev-утилита)
 app.delete('/images', async (_req, res) => {
@@ -213,6 +234,35 @@ app.delete('/images', async (_req, res) => {
     res.json({ deleted: r.deletedCount ?? 0 });
   } catch (e:any) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// Удаление одного изображения по id
+app.delete('/images/:id', async (req, res) => {
+  try {
+    await connectDB();
+
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id required' });
+
+    // найдём doc, чтобы удалить файлы на диске
+    const doc = await ImageModel.findById(id).lean();
+    if (!doc) return res.status(404).json({ error: 'not found' });
+
+    const filesToRemove = [doc.filename, doc.thumb].filter(Boolean) as string[];
+    for (const f of filesToRemove) {
+      const full = getFilePath(f, f === doc.thumb);
+      // fs уже импортирован выше
+      if (fs.existsSync(full)) {
+        try { await fs.promises.unlink(full); } catch {}
+      }
+    }
+
+    await ImageModel.deleteOne({ _id: id });
+
+    res.json({ ok: true, deleted: 1, id });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || String(e) });
   }
 });
 

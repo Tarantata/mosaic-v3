@@ -1,36 +1,61 @@
 "use client";
+
 import { useState } from "react";
-import axios from "axios";
+import ModeSwitch from "./components/ModeSwitch";
+import UserPanel from "./components/UserPanel";
+import AdminPanel from "./components/AdminPanel";
+import InternalGallery from "./components/InternalGallery";
+import UploadedGallery from "./components/UploadedGallery";
+import UploadExternal from "./components/UploadExternal";
 
-type ClusterResp = { ok: boolean; palette?: string[]; stats?: { k?: number } };
-type CellsResp   = { ok: boolean; cells?: number; dxf?: string };
+type Target = { width: number; height: number };
+type Selected = { name: string; url: string };
 
-export default function Home() {
-  const [status, setStatus] = useState("idle");
+export default function Page() {
+  const [mode, setMode] = useState<"user" | "admin">("user");
+  const [selected, setSelected] = useState<Selected | null>(null);
+  const [target, setTarget] = useState<Target | undefined>();
 
-  const run = async () => {
-    try {
-      setStatus("running…");
-      const clusterRes = await axios.post<ClusterResp>(`/api/cluster`, { k: 16 });
-      const cellsRes   = await axios.post<CellsResp>(  `/api/cells`,   { grid: [100, 100] });
-      setStatus(`done: palette=${clusterRes.data.stats?.k ?? "?"}, cells=${cellsRes.data.cells ?? "?"}`);
-    } catch (e: unknown) {
-      let msg = "unknown";
-      if (e && typeof e === "object" && "message" in e) msg = String((e as any).message);
-      // axios может отдавать тело ошибки:
-      // @ts-ignore
-      const body = (e as any)?.response?.data ? JSON.stringify((e as any).response.data) : "";
-      setStatus(`error: ${msg} ${body}`);
-    }
+  const triggerReload = () => {
+    window.dispatchEvent(new CustomEvent("reload-uploads"));
   };
 
   return (
-    <main className="p-6">
-      <h1 className="text-2xl font-bold">Mosaic v3 — MVP</h1>
-      <button className="mt-4 px-4 py-2 rounded bg-black text-white" onClick={run}>
-        Запустить заглушки
-      </button>
-      <div className="mt-4">{status}</div>
+    <main className="space-y-6 p-3">
+      <ModeSwitch mode={mode} onMode={setMode} />
+
+      <InternalGallery
+        onPicked={async (name: string) => {
+          const r = await fetch("/api/upload-from-internal", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+          if (!r.ok) {
+            console.error("upload-from-internal failed", r.status, await r.text());
+            alert("Не удалось скопировать в «Загруженные»");
+            return;
+          }
+          setSelected({ name, url: `/uploads/${name}` });
+          triggerReload();
+        }}
+        onRefreshUploads={triggerReload}
+      />
+
+      {/* Загрузка внешних файлов */}
+      <UploadExternal />
+
+      {/* Загруженные */}
+      <UploadedGallery />
+
+      {mode === "user" ? (
+        <UserPanel
+          selected={selected ?? undefined}
+          onSetTarget={(t) => setTarget(t)}
+        />
+      ) : (
+        <AdminPanel src={selected?.url} target={target} />
+      )}
     </main>
   );
 }

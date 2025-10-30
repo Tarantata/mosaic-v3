@@ -7,6 +7,12 @@ services:
     container_name: mosaic-app
     ports:
       - '3000:3000'
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s  
     environment:
       - NODE_ENV=development
       - GATEWAY_URL=http://gateway:9080
@@ -82,6 +88,7 @@ services:
 
   # === IMAGE LOADER ===
   image-loader:
+    profiles: ["block4"]  
     build: ./services/image-loader
     container_name: mosaic-image-loader
     environment:
@@ -99,11 +106,12 @@ services:
     volumes:
       - ./data/images:/data/images
       - ./data/thumbs:/data/thumbs
-      - ./internal-gallery:/internal-gallery 
+      - ./internal-gallery:/app/public/internal-gallery 
       - ./services/image-loader/public:/app/public
 
   # === SCALER ===
   scaler:
+    profiles: ["block4"]  
     build:
       context: ./services/scaler
     container_name: mosaic-scaler

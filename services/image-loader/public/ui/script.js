@@ -17,6 +17,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const btnClearGallery    = document.getElementById('btnClearGallery');
   const btnShowInternal    = document.getElementById('btnShowInternal');
   const btnImportSelected  = document.getElementById('btnImportSelected');
+  const btnDeleteSelected  = document.getElementById('btnDeleteSelected');
 
   const dropzone           = document.getElementById('dropzone');
   const fileInput          = document.getElementById('fileInput');
@@ -55,12 +56,21 @@ window.addEventListener('DOMContentLoaded', () => {
   const kernelEl           = document.getElementById('kernel');
   const btnAdminPreview    = document.getElementById('btnAdminPreview');
 
+  const searchEl      = document.getElementById('search');
+  const mimeFilterEl  = document.getElementById('mimeFilter');
+  const limitEl       = document.getElementById('limit');
+  const sortEl        = document.getElementById('sort');
+  const prevPageBtn   = document.getElementById('prevPage');
+  const nextPageBtn   = document.getElementById('nextPage');
+  const pageInfoEl    = document.getElementById('pageInfo');
+
   // Проверка наличия ключевых элементов
   const req = (el, id) => { if (!el) throw new Error(`Не найден элемент #${id}`); return el; };
   req(gallerySection,'gallerySection'); req(galleryEl,'gallery');
   req(internalSection,'internalSection'); req(internalGalleryEl,'internalGallery');
   req(btnShowGallery,'btnShowGallery'); req(btnClearGallery,'btnClearGallery');
   req(btnShowInternal,'btnShowInternal'); req(btnImportSelected,'btnImportSelected');
+  req(btnDeleteSelected, 'btnDeleteSelected');
   req(dropzone,'dropzone'); req(fileInput,'fileInput'); req(btnUpload,'btnUpload'); req(uploadLog,'uploadLog');
   req(adminPanel,'adminPanel'); req(adminToggle,'adminToggle'); req(adminControls,'adminControls');
   req(adminOutput,'adminOutput'); req(adminPreview,'adminPreview'); req(selectedIdBox,'selectedIdBox');
@@ -69,11 +79,15 @@ window.addEventListener('DOMContentLoaded', () => {
   req(userPanel,'userPanel'); req(userUnits,'userUnits'); req(userW,'userW'); req(userH,'userH');
   req(userDpiBox,'userDpiBox'); req(userFit,'userFit'); req(userBg,'userBg');
   req(btnUserSave,'btnUserSave'); req(btnExportProject,'btnExportProject'); req(btnTestExport,'btnTestExport'); req(userSavedNote,'userSavedNote');
+  req(searchEl,'search'); req(mimeFilterEl,'mimeFilter'); req(limitEl,'limit');
+  req(sortEl,'sort'); req(prevPageBtn,'prevPage'); req(nextPageBtn,'nextPage'); req(pageInfoEl,'pageInfo');
+
   if (!userDpi) console.warn('userDpi not found (ok for px mode)');
 
   let galleryVisible   = true;   // по умолчанию видна
   let internalVisible  = false;  // по умолчанию скрыта (в HTML есть класс hidden)
-  const selectedInternal = new Set();
+  const selectedInternal = new Set();  // внутренняя галерея
+  let selectedUploaded = new Set();   // пользовательские загрузки
   let currentImageId   = null;
   let userParams = {
     units: 'px',
@@ -82,6 +96,15 @@ window.addEventListener('DOMContentLoaded', () => {
     dpi: 300,
     fit: 'contain',
     background: '#ffffff'
+  };
+  let uploadedState = {
+    q: '',
+    mime: '',
+    limit: 12,
+    sort: 'newest',
+    page: 1,
+    pages: 1,
+    total: 0
   };
 
   function loadUserParams() {
@@ -115,6 +138,42 @@ window.addEventListener('DOMContentLoaded', () => {
     localStorage.setItem('mosaic_user_params', JSON.stringify(userParams));
   }
 
+  applyStateToControls();
+
+  // загрузить/сохранить в localStorage
+function loadUploadedState() {
+  try { const s = JSON.parse(localStorage.getItem('uploadedState') || ''); if (s) uploadedState = { ...uploadedState, ...s }; } catch {}
+}
+function saveUploadedState() {
+  localStorage.setItem('uploadedState', JSON.stringify(uploadedState));
+}
+loadUploadedState();
+
+// применить состояние в контролы
+function applyStateToControls() {
+  searchEl.value     = uploadedState.q;
+  mimeFilterEl.value = uploadedState.mime;
+  limitEl.value      = String(uploadedState.limit);
+  sortEl.value       = uploadedState.sort;
+  renderPagination();
+}
+
+function buildQuery() {
+  const p = new URLSearchParams();
+  if (uploadedState.q)    p.set('q', uploadedState.q);
+  if (uploadedState.mime) p.set('mime', uploadedState.mime);
+  if (uploadedState.sort) p.set('sort', uploadedState.sort);
+  p.set('page',  String(uploadedState.page));
+  p.set('limit', String(uploadedState.limit));
+  return '/images?' + p.toString();
+}
+
+function renderPagination() {
+  pageInfoEl.textContent = `Стр. ${uploadedState.page} / ${uploadedState.pages} · всего ${uploadedState.total}`;
+  prevPageBtn.disabled = uploadedState.page <= 1;
+  nextPageBtn.disabled = uploadedState.page >= uploadedState.pages;
+}
+
   async function fetchJSON(url, opts = {}) {
     const r = await fetch(url, opts);
     if (!r.ok) {
@@ -130,15 +189,47 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // === ГАЛЕРЕЯ ЗАГРУЖЕННЫХ ===
   async function loadGallery() {
-    const list = await fetchJSON('/images');
+    // запрос с параметрами
+    const url  = buildQuery();
+    console.log('📦 gallery request →', url);
+    const data = await fetchJSON(url);
+    const list = Array.isArray(data) ? data : (data.items || []);
+    // если сервер вернул расширенный ответ — обновим стейт страниц
+    if (!Array.isArray(data)) {
+      uploadedState.page  = Number(data.page  || 1);
+      uploadedState.pages = Number(data.pages || 1);
+      uploadedState.total = Number(data.total || list.length || 0);
+      renderPagination();
+      saveUploadedState();
+    }
+    
     galleryEl.innerHTML = '';
+    selectedUploaded.clear();
+    btnDeleteSelected.classList.add('hidden');
+    selectedUploaded.clear?.();    // если есть набор выбранных
+    if (btnDeleteSelected) btnDeleteSelected.classList.add('hidden');
+
     list.forEach(it => {
       const card = document.createElement('div'); card.className = 'card';
       const img = document.createElement('img'); img.className = 'thumb';
       img.src = `/images/${it._id}/thumb`;
+
       const meta = document.createElement('div');
       meta.innerHTML = `<div><b>${it.originalName || it.filename}</b></div>
         <div>${it.mime || ''} ${it.width || '?'}×${it.height || '?'}</div>`;
+
+      // чекбокс для удаления
+      const actions = document.createElement('div');
+      const select = document.createElement('input');
+      select.type = 'checkbox';
+      select.addEventListener('change', () => {
+        const id = String(it._id);
+        if (select.checked) selectedUploaded.add(id);
+        else selectedUploaded.delete(id);
+        btnDeleteSelected.classList.toggle('hidden', selectedUploaded.size === 0);
+      });
+      actions.appendChild(select);
+      card.appendChild(actions);  
 
       // выбор источника для Admin
       card.addEventListener('click', () => {
@@ -150,6 +241,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
       card.appendChild(img);
       card.appendChild(meta);
+      card.appendChild(actions);
       galleryEl.appendChild(card);
     });
   }
@@ -219,6 +311,76 @@ window.addEventListener('DOMContentLoaded', () => {
       if (galleryVisible) await loadGallery();
     } catch (e) {
       uploadLog.textContent = 'Ошибка: ' + e.message;
+    }
+  });
+
+  btnDeleteSelected.addEventListener('click', async () => {
+    if (selectedUploaded.size === 0) return;
+    if (!confirm(`Удалить выбранные (${selectedUploaded.size})?`)) return;
+    btnDeleteSelected.disabled = true;
+    try {
+      const ids = Array.from(selectedUploaded);
+      for (const id of ids) {
+        const r = await fetch(`/images/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!r.ok) {
+          const t = await r.text().catch(()=> '');
+          alert(`Не удалось удалить ${id}: ${t || r.status}`);
+        }
+      }
+      await loadGallery();
+      alert('Удаление завершено');
+    } finally {
+      btnDeleteSelected.disabled = false;
+    }
+  });  
+
+    // --- Поиск/фильтры/пагинация (2.4)
+  let searchTimer = null;
+
+  searchEl.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      uploadedState.q = searchEl.value.trim();
+      uploadedState.page = 1;
+      saveUploadedState();
+      loadGallery().catch(console.error);
+    }, 250);
+  });
+
+  mimeFilterEl.addEventListener('change', () => {
+    uploadedState.mime = mimeFilterEl.value;
+    uploadedState.page = 1;
+    saveUploadedState();
+    loadGallery().catch(console.error);
+  });
+
+  limitEl.addEventListener('change', () => {
+    uploadedState.limit = Math.max(1, Number(limitEl.value || 12));
+    uploadedState.page = 1;
+    saveUploadedState();
+    loadGallery().catch(console.error);
+  });
+
+  sortEl.addEventListener('change', () => {
+    uploadedState.sort = sortEl.value;
+    uploadedState.page = 1;
+    saveUploadedState();
+    loadGallery().catch(console.error);
+  });
+
+  prevPageBtn.addEventListener('click', () => {
+    if (uploadedState.page > 1) {
+      uploadedState.page--;
+      saveUploadedState();
+      loadGallery().catch(console.error);
+    }
+  });
+
+  nextPageBtn.addEventListener('click', () => {
+    if (uploadedState.page < uploadedState.pages) {
+      uploadedState.page++;
+      saveUploadedState();
+      loadGallery().catch(console.error);
     }
   });
 

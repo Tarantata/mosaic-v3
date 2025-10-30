@@ -38,7 +38,37 @@
     <button id="btnClearGallery">Очистить «Загруженные»</button>
     <button id="btnShowInternal">Открыть/закрыть внутреннюю галерею</button>
     <button id="btnImportSelected" class="hidden">Загрузить выбранные</button>
+    <button id="btnDeleteSelected" class="hidden">Удалить выбранные</button>
   </div>
+
+  <div class="section" id="uploadedControls" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px;">
+    <input id="search" type="text" placeholder="Поиск по имени/MIME" style="min-width:220px;">
+    <select id="mimeFilter" title="MIME">
+      <option value="">Все типы</option>
+      <option value="image/jpeg">image/jpeg</option>
+      <option value="image/png">image/png</option>
+      <option value="image/webp">image/webp</option>
+      <option value="image/gif">image/gif</option>
+    </select>
+    <label>на странице:
+      <select id="limit">
+        <option>12</option><option>24</option><option>36</option><option>48</option>
+      </select>
+    </label>
+    <label>сортировка:
+      <select id="sort">
+        <option value="newest">сначала новые</option>
+        <option value="oldest">сначала старые</option>
+      </select>
+    </label>
+
+    <div style="margin-left:auto; display:flex; gap:6px; align-items:center;">
+      <button id="prevPage">← Назад</button>
+      <span id="pageInfo" style="min-width:140px; text-align:center;"></span>
+      <button id="nextPage">Вперёд →</button>
+    </div>
+  </div>
+
 
   <!-- Загруженные -->
   <section id="gallerySection" class="section">

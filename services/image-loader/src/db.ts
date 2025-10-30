@@ -20,6 +20,9 @@ const ImageSchema = new mongoose.Schema({
 
 export const ImageModel = mongoose.model('images', ImageSchema);
 
+ImageModel.collection.createIndex({ originalName: 'text', filename: 'text', mime: 1 })
+  .catch(err => console.warn('createIndex(images) warn:', err?.message || err));
+
 // === Canvas Settings Model ===
 
 const CanvasSchema = new mongoose.Schema({

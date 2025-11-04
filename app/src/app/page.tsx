@@ -1,12 +1,13 @@
 "use client";
-
 import { useState } from "react";
+
+// ВАЖНО: все эти компоненты импортируются БЕЗ фигурных скобок,
+// потому что у них default export.
 import ModeSwitch from "./components/ModeSwitch";
-import UserPanel from "./components/UserPanel";
-import AdminPanel from "./components/AdminPanel";
 import InternalGallery from "./components/InternalGallery";
 import UploadedGallery from "./components/UploadedGallery";
-import UploadExternal from "./components/UploadExternal";
+import UserPanel from "./components/UserPanel";
+import AdminPanel from "./components/AdminPanel";
 
 type Target = { width: number; height: number };
 type Selected = { name: string; url: string };
@@ -24,6 +25,7 @@ export default function Page() {
     <main className="space-y-6 p-3">
       <ModeSwitch mode={mode} onMode={setMode} />
 
+      {/* Внутренняя галерея (копирует в /uploads и выбирает) */}
       <InternalGallery
         onPicked={async (name: string) => {
           const r = await fetch("/api/upload-from-internal", {
@@ -42,19 +44,25 @@ export default function Page() {
         onRefreshUploads={triggerReload}
       />
 
-      {/* Загрузка внешних файлов */}
-      <UploadExternal />
+      {/* Загруженные изображения (выбор файла) */}
+      <UploadedGallery
+        onPicked={(it) => {
+          setSelected({ name: it.name, url: it.url });
+        }}
+      />
 
-      {/* Загруженные */}
-      <UploadedGallery />
-
+      {/* Панели */}
       {mode === "user" ? (
         <UserPanel
           selected={selected ?? undefined}
           onSetTarget={(t) => setTarget(t)}
         />
       ) : (
-        <AdminPanel src={selected?.url} target={target} />
+        <AdminPanel
+          src={selected?.url}
+          target={target}
+          onSetTarget={(t) => setTarget(t)}
+        />
       )}
     </main>
   );

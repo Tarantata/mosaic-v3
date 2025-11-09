@@ -1,5 +1,7 @@
 "use client";
-import React, { CSSProperties, useEffect, useRef, useState } from "react";
+import React, { CSSProperties, useEffect, useRef, useState, useCallback } from "react";
+import { uniformQuantize } from "@/lib/image/quantize";
+import { performOptimization } from "@/lib/image/optimize";
 
 type Target = { width: number; height: number };
 
@@ -16,11 +18,6 @@ const MAX_CANVAS_SIDE = 16384;
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 8;
 const ZOOM_STEP = 0.1;
-
-// сегментация (равномерная квантовка)
-const DEFAULT_K = 64;     // общее число цветов
-const MIN_K = 8;
-const MAX_K = 256;
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -56,20 +53,166 @@ export default function AdminPanel({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pixelatedStyle: CSSProperties = { imageRendering: "pixelated", background: "#f8fafc" };
 
-  // исходное изображение и «чистая база» после масштабирования/оптимизации
+  // исходное изображение и «чистая база»
   const imageRef = useRef<HTMLImageElement | null>(null);
   const baseImageDataRef = useRef<ImageData | null>(null);
 
   // оптимизированные габариты
   const [optDims, setOptDims] = useState<{ width: number; height: number } | null>(null);
 
-  // сегментация (квантовка)
-  const [k, setK] = useState(DEFAULT_K);
-  const [, setSegBusy] = useState(false);
+  // сегментация: текущее (на экране) и «оригинал» (до оптимизаций)
   const [segReady, setSegReady] = useState(false);
   const [showEdges, setShowEdges] = useState(false);
   const segPaletteRef = useRef<Uint8Array | null>(null);
   const segLabelsRef = useRef<Uint32Array | null>(null);
+  const segLabelsOrigRef = useRef<Uint32Array | null>(null);
+
+  // размеры сегментации (могут быть уменьшенными относительно canvas)
+  const segDimsRef = useRef<{ w: number; h: number; scale: number } | null>(null);
+
+  // ===== АДАПТИВНЫЕ УРОВНИ (Variant B) =====
+  type LevelEntry = {
+    L: number;           // уровни на канал
+    K: number;           // ~ L^3
+    palette: Uint8Array; // палитра
+    labels: Uint32Array; // карта бинов (на уменьшенной сетке)
+  };
+  const [effectiveLevels, setEffectiveLevels] = useState<LevelEntry[]>([]);
+  const [effIdx, setEffIdx] = useState(0);
+  const [minAreaFactor, setMinAreaFactor] = useState(1.0);
+
+  // фоновая сборка уровней
+  const buildingRef = useRef(false);
+  const cancelBuildRef = useRef<{ cancel: boolean }>({ cancel: false });
+
+  // requestIdleCallback с фолбэком (без any)
+  type IdleDeadline = { timeRemaining: () => number };
+  type RequestIdle = (cb: (deadline: IdleDeadline) => void) => number;
+  function scheduleIdle(cb: (deadline: IdleDeadline) => void) {
+    const w = window as unknown as { requestIdleCallback?: RequestIdle };
+    if (typeof w.requestIdleCallback === "function") w.requestIdleCallback(cb);
+    else setTimeout(() => cb({ timeRemaining: () => 50 }), 0);
+  }
+
+  // Быстрое даунскейление ImageData в offscreen canvas
+  function getDownscaledImageData(base: ImageData, targetMaxSide = 1024) {
+    const srcW = base.width;
+    const srcH = base.height;
+    const maxSide = Math.max(srcW, srcH);
+    const scale = maxSide > targetMaxSide ? targetMaxSide / maxSide : 1;
+    const dstW = Math.max(1, Math.round(srcW * scale));
+    const dstH = Math.max(1, Math.round(srcH * scale));
+
+    if (scale === 1) {
+      return { img: base, w: srcW, h: srcH, scale: 1 };
+    }
+
+    const off = document.createElement("canvas");
+    off.width = dstW;
+    off.height = dstH;
+    const offCtx = off.getContext("2d")!;
+    // кладём исходный ImageData в временный canvas источника
+    const srcCanvas = document.createElement("canvas");
+    srcCanvas.width = srcW;
+    srcCanvas.height = srcH;
+    const srcCtx = srcCanvas.getContext("2d")!;
+    srcCtx.putImageData(base, 0, 0);
+
+    offCtx.imageSmoothingEnabled = true;
+    offCtx.imageSmoothingQuality = "medium";
+    offCtx.drawImage(srcCanvas, 0, 0, srcW, srcH, 0, 0, dstW, dstH);
+    const down = offCtx.getImageData(0, 0, dstW, dstH);
+    return { img: down, w: dstW, h: dstH, scale };
+  }
+
+  // доля отличий (для отбора «полезных» уровней)
+  function diffRatio(a: Uint32Array, b: Uint32Array) {
+    if (a.length !== b.length) return 1;
+    let diff = 0;
+    const n = a.length;
+    for (let i = 0; i < n; i++) {
+      if (a[i] !== b[i]) {
+        diff++;
+        if (diff > n * 0.01) return diff / n; // ранний выход на 1%
+      }
+    }
+    return diff / n;
+  }
+
+  // Фоновая сборка «полезных» уровней на уменьшенной сетке + мгновенный старт
+  async function buildEffectiveLevels() {
+    if (buildingRef.current) return;
+    const base = baseImageDataRef.current;
+    if (!base) return;
+
+    buildingRef.current = true;
+    cancelBuildRef.current.cancel = false;
+    const cancelToken = cancelBuildRef.current;
+
+    // 0) Даунскейлим базу до ~1024 по большей стороне
+    const { img: small, w: smallW, h: smallH, scale } = getDownscaledImageData(base, 1024);
+    segDimsRef.current = { w: smallW, h: smallH, scale }; // для рендера
+    // полезный коэффициент из канваса в «малую» сетку
+    const pitchPxFull = HOLE_PITCH_MM * PREVIEW_PX_PER_MM;
+    const pitchPxSmall = pitchPxFull * (smallW / (canvasRef.current?.width || smallW));
+
+    // 1) Мгновенный старт — L=4
+    const L0 = 4;
+    const K0 = L0 * L0 * L0;
+    const first = uniformQuantize(small.data, smallW, smallH, K0);
+
+    // применяем сразу
+    setEffectiveLevels([{ L: L0, K: K0, palette: first.palette, labels: first.labels }]);
+    setEffIdx(0);
+    segPaletteRef.current = first.palette;
+    segLabelsRef.current = first.labels;
+    segLabelsOrigRef.current = first.labels;
+    setSegReady(true);
+    // быстрый показ
+    renderPipeline({ withSegmentation: true });
+
+    // 2) Фоновый добор уровней
+    const kept: LevelEntry[] = [{ L: L0, K: K0, palette: first.palette, labels: first.labels }];
+    let prev = first.labels;
+
+    const Lmin = 2, Lmax = 16;
+    let cur = Lmin;
+
+    const step = () => {
+      if (cancelToken.cancel) { buildingRef.current = false; return; }
+      if (cur === L0) { cur++; step(); return; }
+
+      scheduleIdle(() => {
+        if (cancelToken.cancel) { buildingRef.current = false; return; }
+        if (cur > Lmax) {
+          setEffectiveLevels(kept);
+          buildingRef.current = false;
+          return;
+        }
+        const K = cur * cur * cur;
+        const { palette, labels } = uniformQuantize(small.data, smallW, smallH, K);
+
+        const dr = diffRatio(labels, prev);
+        if (dr >= 0.01) {
+          kept.push({ L: cur, K, palette, labels });
+          prev = labels;
+        }
+        cur++;
+        step();
+      });
+    };
+    step();
+
+    // сохраняем на будущее масштаб сетки отверстий в «малой» сетке
+    // передадим в optimizator через segDimsRef (рассчитает сам)
+    void pitchPxSmall; // подсказка, что переменная учтена в логике (не удаляем)
+  }
+
+  // отменяем сборку при размонтировании
+  useEffect(() => {
+    const token = cancelBuildRef.current; // snapshot
+    return () => { token.cancel = true; };
+  }, []);
 
   // подхватываем существующий target в инпуты
   useEffect(() => {
@@ -133,7 +276,7 @@ export default function AdminPanel({
     ctx.clearRect(0, 0, cW, cH);
     ctx.drawImage(img, 0, 0, cW, cH);
 
-    // сохраняем «чистую» копию — без сетки и без границ
+    // snapshot чистой базы
     baseImageDataRef.current = ctx.getImageData(0, 0, cW, cH);
   }
 
@@ -166,7 +309,7 @@ export default function AdminPanel({
     }
     ctx.restore();
 
-    // отверстия (шаг 8 мм, диаметр 4 мм), первый центр — 8 мм от краёв
+    // отверстия (шаг 8 мм, диаметр 4 мм)
     const pitchPx = HOLE_PITCH_MM * pxPerMm;
     const holeRadiusPx = (HOLE_DIAM_MM / 2) * pxPerMm;
     const startX = pitchPx;
@@ -187,117 +330,59 @@ export default function AdminPanel({
     ctx.restore();
   }
 
-  // ====== РАВНОМЕРНАЯ КВАНТОВКА ======
-  // K -> уровни на канал L ≈ cube root
-  function levelsForK(total: number) {
-    const lv = Math.round(Math.cbrt(total));
-    return clamp(lv, 2, 16); // ограничим разумно
-  }
-
-  function uniformQuantize(
-    data: Uint8ClampedArray,
-    width: number,
-    height: number,
-    totalColors: number
-  ) {
-    const L = levelsForK(totalColors); // уровни на канал
-    const step = 256 / L;
-
-    // быстрая функция "центр корзины" по компоненте
-    const binCenter = (v: number) => {
-      let b = Math.floor(v / step);
-      if (b >= L) b = L - 1;
-      const center = Math.round(b * step + step / 2 - 0.5);
-      return clamp(center, 0, 255);
-    };
-
-    // индекс корзины по трём каналам
-    const binIndex = (r: number, g: number, b: number) => {
-      const br = Math.floor(r / step);
-      const bg = Math.floor(g / step);
-      const bb = Math.floor(b / step);
-      // компактный индекс
-      return br * L * L + bg * L + bb;
-    };
-
-    const paletteSize = L * L * L;
-    const palette = new Uint8Array(paletteSize * 3);
-    const labels = new Uint32Array(width * height);
-
-    // заранее заполним палитру центрами
-    for (let br = 0; br < L; br++) {
-      for (let bg = 0; bg < L; bg++) {
-        for (let bb = 0; bb < L; bb++) {
-          const idx = br * L * L + bg * L + bb;
-          const r = binCenter(br * step);
-          const g = binCenter(bg * step);
-          const b = binCenter(bb * step);
-          palette[idx * 3] = r;
-          palette[idx * 3 + 1] = g;
-          palette[idx * 3 + 2] = b;
-        }
-      }
-    }
-
-    // разметка пикселей
-    for (let i = 0, p = 0; i < labels.length; i++, p += 4) {
-      labels[i] = binIndex(data[p], data[p + 1], data[p + 2]);
-    }
-
-    return { palette, labels, L };
-  }
-
-  function renderQuantized(
+  // ===== РЕНДЕРЫ (масштабированные из «малой» сетки на canvas) =====
+  function renderQuantizedScaled(
     palette: Uint8Array,
     labels: Uint32Array,
-    width: number,
-    height: number
+    smallW: number,
+    smallH: number,
+    canvas: HTMLCanvasElement
   ) {
-    const c = canvasRef.current!;
-    const ctx = c.getContext("2d");
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    const out = ctx.createImageData(width, height);
-    const od = out.data;
+    // 1) собираем картинку smallW×smallH
+    const smallImage = ctx.createImageData(smallW, smallH);
+    const sd = smallImage.data;
     for (let i = 0; i < labels.length; i++) {
       const ci = labels[i];
-      const r = palette[ci * 3];
-      const g = palette[ci * 3 + 1];
-      const b = palette[ci * 3 + 2];
       const p = i * 4;
-      od[p] = r;
-      od[p + 1] = g;
-      od[p + 2] = b;
-      od[p + 3] = 255;
+      sd[p] = palette[ci * 3];
+      sd[p + 1] = palette[ci * 3 + 1];
+      sd[p + 2] = palette[ci * 3 + 2];
+      sd[p + 3] = 255;
     }
-    ctx.putImageData(out, 0, 0);
+    // 2) кладём на offscreen и растягиваем до размера canvas
+    const off = document.createElement("canvas");
+    off.width = smallW;
+    off.height = smallH;
+    const offCtx = off.getContext("2d")!;
+    offCtx.putImageData(smallImage, 0, 0);
+
+    ctx.imageSmoothingEnabled = false; // пиксель-арт
+    ctx.drawImage(off, 0, 0, smallW, smallH, 0, 0, canvas.width, canvas.height);
   }
 
-  // тонкий контур: красим пиксель, если метка отличается с правым/нижним соседом
-  function renderEdges(
+  function renderEdgesScaled(
     labels: Uint32Array,
-    width: number,
-    height: number,
+    smallW: number,
+    smallH: number,
+    canvas: HTMLCanvasElement,
     rgba: [number, number, number, number] = [255, 0, 0, 180]
   ) {
-    const c = canvasRef.current!;
-    const ctx = c.getContext("2d");
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // соберём карту рёбер
-    const edge = new ImageData(width, height);
+    // 1) собираем карту рёбер на «малой» сетке
+    const edge = new ImageData(smallW, smallH);
     const ed = edge.data;
-
-    for (let y = 0; y < height; y++) {
-      const row = y * width;
-      for (let x = 0; x < width; x++) {
+    for (let y = 0; y < smallH; y++) {
+      const row = y * smallW;
+      for (let x = 0; x < smallW; x++) {
         const i = row + x;
         const v = labels[i];
         let boundary = false;
-
-        if (x + 1 < width && labels[i + 1] !== v) boundary = true;
-        else if (y + 1 < height && labels[i + width] !== v) boundary = true;
-
+        if (x + 1 < smallW && labels[i + 1] !== v) boundary = true;
+        else if (y + 1 < smallH && labels[i + smallW] !== v) boundary = true;
         if (!boundary) continue;
         const p = i * 4;
         ed[p] = rgba[0];
@@ -306,323 +391,18 @@ export default function AdminPanel({
         ed[p + 3] = rgba[3];
       }
     }
-
-    // ВАЖНО: класть не через putImageData (оно перезаписывает),
-    // а через drawImage с промежуточного канваса — тогда альфа учтётся.
+    // 2) рисуем поверх, растягивая до canvas
     const off = document.createElement("canvas");
-    off.width = width;
-    off.height = height;
+    off.width = smallW;
+    off.height = smallH;
     const offCtx = off.getContext("2d")!;
     offCtx.putImageData(edge, 0, 0);
 
-    ctx.drawImage(off, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, 0, 0, smallW, smallH, 0, 0, canvas.width, canvas.height);
   }
 
-  // ===== Оптимизация сегментации: слияние крошек и компонент без отверстий =====
-
-  // Быстрый union-find (слияние областей)
-  class UF {
-    parent: Uint32Array;
-    size: Uint32Array;
-    constructor(n: number) {
-      this.parent = new Uint32Array(n);
-      this.size = new Uint32Array(n);
-      for (let i = 0; i < n; i++) { this.parent[i] = i; this.size[i] = 1; }
-    }
-    find(x: number): number {
-      while (this.parent[x] !== x) { this.parent[x] = this.parent[this.parent[x]]; x = this.parent[x]; }
-      return x;
-    }
-    union(a: number, b: number) {
-      a = this.find(a); b = this.find(b); if (a === b) return;
-      if (this.size[a] < this.size[b]) { const t = a; a = b; b = t; }
-      this.parent[b] = a; this.size[a] += this.size[b];
-    }
-  }
-
-  // Построение связных компонент внутри одного «бина» (labels — это бин квантовки)
-  function labelComponents(labels: Uint32Array, w: number, h: number) {
-    const comp = new Int32Array(w * h); comp.fill(-1);
-    const compLabelBin: number[] = [];
-    const compSize: number[] = [];
-    let comps = 0;
-
-    const stackX: number[] = [];
-    const stackY: number[] = [];
-    const idx = (x: number, y: number) => y * w + x;
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = idx(x, y);
-        if (comp[i] !== -1) continue;
-        const bin = labels[i];
-        // flood fill 4-связностью по одному bin
-        let curSize = 0;
-        stackX.length = 0; stackY.length = 0;
-        stackX.push(x); stackY.push(y);
-        comp[i] = comps;
-
-        while (stackX.length) {
-          const cx = stackX.pop()!; const cy = stackY.pop()!;
-          curSize++;
-          const neighbors = [
-            [cx + 1, cy],
-            [cx - 1, cy],
-            [cx, cy + 1],
-            [cx, cy - 1],
-          ];
-          for (const [nx, ny] of neighbors) {
-            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-            const j = idx(nx, ny);
-            if (comp[j] !== -1) continue;
-            if (labels[j] !== bin) continue;
-            comp[j] = comps;
-            stackX.push(nx); stackY.push(ny);
-          }
-        }
-        compLabelBin.push(bin);
-        compSize.push(curSize);
-        comps++;
-      }
-    }
-
-    return { comp, compLabelBin, compSize, comps };
-  }
-
-  // Соседство компонент (граница в пикселях)
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  function buildAdjacency(comp: Int32Array, w: number, h: number, _comps: number) {
-    const adj = new Map<number, Map<number, number>>(); // a -> (b -> borderPixels)
-    const idx = (x: number, y: number) => y * w + x;
-
-    const inc = (a: number, b: number) => {
-      if (a === b) return;
-      if (!adj.has(a)) adj.set(a, new Map());
-      const m = adj.get(a)!;
-      m.set(b, (m.get(b) || 0) + 1);
-    };
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = idx(x, y); const c = comp[i];
-        if (x + 1 < w) { const r = comp[i + 1]; if (r !== c) { inc(c, r); inc(r, c); } }
-        if (y + 1 < h) { const d = comp[i + w]; if (d !== c) { inc(c, d); inc(d, c); } }
-      }
-    }
-    return adj;
-  }
-
-  // Центры отверстий (через 8 мм) в пикселях превью
-  function computeHoleCentersInside(w: number, h: number) {
-    const pxPerMm = PREVIEW_PX_PER_MM;
-    const pitchPx = HOLE_PITCH_MM * pxPerMm;
-    const start = pitchPx; // первый центр на 8 мм от края
-    const centers: { x: number; y: number }[] = [];
-    for (let y = start; y < h; y += pitchPx) {
-      for (let x = start; x < w; x += pitchPx) {
-        centers.push({ x: Math.round(x), y: Math.round(y) });
-      }
-    }
-    return centers;
-  }
-
-  function componentsWithHole(comp: Int32Array, w: number, h: number, comps: number) {
-    const hasHole = new Array<boolean>(comps).fill(false);
-    const centers = computeHoleCentersInside(w, h);
-    const idx = (x: number, y: number) => y * w + x;
-
-    for (const c of centers) {
-      if (c.x < 0 || c.y < 0 || c.x >= w || c.y >= h) continue;
-      const id = comp[idx(c.x, c.y)];
-      if (id >= 0) hasHole[id] = true;
-    }
-    return hasHole;
-  }
-
-  // ===== performOptimization: слияние крошек и бездырочных компонент + перекраска =====
-  function performOptimization(
-    labels: Uint32Array,
-    w: number,
-    h: number,
-    minPx: number
-  ) {
-    // 1) Размечаем компоненты и собираем граф соседств
-    const { comp, compLabelBin, compSize, comps } = labelComponents(labels, w, h);
-    const adj = buildAdjacency(comp, w, h, comps);
-    const hasHole = componentsWithHole(comp, w, h, comps);
-    const uf = new UF(comps);
-
-    function bestNeighbor(a: number): number | null {
-      const m = adj.get(a) || new Map<number, number>();
-      let bestId: number | null = null;
-      let bestEdge = -1;
-      for (const [b, edge] of m) {
-        if (edge > bestEdge) {
-          bestEdge = edge;
-          bestId = b;
-        }
-      }
-      return bestId;
-    }
-
-    // 2) Схлопываем мелкие/«плохие» компоненты в ближайшего сильного соседа
-    let changed = true;
-    let iter = 0;
-    const MAX_ITERS = 5;
-
-    while (changed && iter < MAX_ITERS) {
-      changed = false;
-      iter++;
-
-      for (let a = 0; a < comps; a++) {
-        const sizeA = compSize[a];
-        const okArea = sizeA >= minPx;
-        const okHole = hasHole[a];
-
-        if (okArea && okHole) continue;
-
-        const nb = bestNeighbor(a);
-        if (nb == null) continue;
-
-        uf.union(a, nb);
-        changed = true;
-      }
-    }
-
-    // 3) Перекрашиваем по корням с усреднением цвета
-    const remap = new Int32Array(comps);
-    for (let a = 0; a < comps; a++) remap[a] = uf.find(a);
-
-    // палитра сегментации: ОДИН раз объявляем pal/bins на всю функцию
-    if (!segPaletteRef.current) return labels;
-    const pal = segPaletteRef.current as unknown as Uint8Array; // [r,g,b,r,g,b,...]
-    const bins = Math.floor(pal.length / 3);
-
-    // суммируем усреднённый цвет по «слепленным» группам
-    const sumR = new Float64Array(comps);
-    const sumG = new Float64Array(comps);
-    const sumB = new Float64Array(comps);
-    const count = new Float64Array(comps);
-
-    for (let i = 0; i < labels.length; i++) {
-      const cid = comp[i];           // исходная компонента
-      const root = remap[cid];       // её корень после union-find
-      let bin = compLabelBin[cid];   // исходный bin этой компоненты
-
-      // страховка от выхода за границы
-      if (bin < 0) bin = 0;
-      if (bin >= bins) bin = bins - 1;
-
-      const base = bin * 3;
-      const r0 = pal[base];
-      const g0 = pal[base + 1];
-      const b0 = pal[base + 2];
-
-      sumR[root] += r0;
-      sumG[root] += g0;
-      sumB[root] += b0;
-      count[root] += 1;
-    }
-
-    const avgColor: Array<[number, number, number]> = new Array(comps);
-    for (let a = 0; a < comps; a++) {
-      if (count[a] > 0) {
-        avgColor[a] = [
-          sumR[a] / count[a],
-          sumG[a] / count[a],
-          sumB[a] / count[a],
-        ];
-      } else {
-        avgColor[a] = [0, 0, 0];
-      }
-    }
-
-    // 4) Переводим пиксели в ближайший цвет палитры (по усреднённому цвету их группы)
-    const outLabels = new Uint32Array(labels.length);
-
-    for (let i = 0; i < labels.length; i++) {
-      const cid = comp[i];
-      const root = remap[cid];
-      const [r, g, b] = avgColor[root];
-
-      let best = 0;
-      let bestDist = 1e9;
-
-      for (let bidx = 0; bidx < bins; bidx++) {
-        const base = bidx * 3;
-        const rr = pal[base];
-        const gg = pal[base + 1];
-        const bb = pal[base + 2];
-        const d = (rr - r) ** 2 + (gg - g) ** 2 + (bb - b) ** 2;
-        if (d < bestDist) {
-          bestDist = d;
-          best = bidx;
-        }
-      }
-
-      outLabels[i] = best;
-    }
-
-    return outLabels;
-  }
-
-  async function optimizeSegments() {
-    const c = canvasRef.current;
-    if (!c || !baseImageDataRef.current || !segLabelsRef.current || !segPaletteRef.current) return;
-
-    setErr("");
-    setInfo("");
-    setBusy(true);
-    try {
-      const w = c.width, h = c.height;
-
-      // «Минимальная площадь»: четверть клетки 8×8 мм в пикселях превью.
-      const pitchPx = HOLE_PITCH_MM * PREVIEW_PX_PER_MM; // 8мм * px/мм
-      const minPx = Math.max(4, Math.round(1.0 * pitchPx * pitchPx));
-
-      const t0 = performance.now();
-      const newLabels = performOptimization(segLabelsRef.current, w, h, minPx);
-      const t1 = performance.now();
-
-      segLabelsRef.current = newLabels;
-      renderPipeline({ withSegmentation: true });
-      setSegReady(true);
-
-      setInfo(`Оптимизация: ${Math.round(t1 - t0)} мс • minPx=${minPx}`);
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "Ошибка оптимизации");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // общий пайплайн отрисовки (всегда начинаем с «чистой базы»)
-  function renderPipeline({ withSegmentation }: { withSegmentation: boolean }) {
-    const c = canvasRef.current;
-    const base = baseImageDataRef.current;
-    if (!c || !base) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-
-    // чистая база
-    ctx.putImageData(base, 0, 0);
-
-    // квантованная картинка
-    if (withSegmentation && segPaletteRef.current && segLabelsRef.current) {
-      renderQuantized(segPaletteRef.current, segLabelsRef.current, c.width, c.height);
-    }
-
-    // контуры
-    if (withSegmentation && showEdges && segLabelsRef.current) {
-      renderEdges(segLabelsRef.current, c.width, c.height);
-    }
-
-    // сетка — в самом конце
-    if (showGrid) drawGridOverlay(c);
-  }
-
-  // КНОПКИ
-
+  // ===== КНОПКИ РАЗМЕРОВ =====
   async function onApplySizes() {
     if (!hasSrc || !validDims) return;
     setErr("");
@@ -633,10 +413,14 @@ export default function AdminPanel({
       const c = canvasRef.current!;
       setOptDims(null);
       setSegReady(false);
-      segLabelsRef.current = null;
       segPaletteRef.current = null;
+      segLabelsRef.current = null;
+      segLabelsOrigRef.current = null;
+      segDimsRef.current = null;
 
       drawBaseAndSnapshot(img, w as number, h as number, c);
+      // Сборка адаптивных уровней на уменьшенной сетке
+      buildEffectiveLevels();
       renderPipeline({ withSegmentation: false });
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "Ошибка отрисовки");
@@ -657,10 +441,13 @@ export default function AdminPanel({
       setOptDims({ width: cw, height: ch });
 
       setSegReady(false);
-      segLabelsRef.current = null;
       segPaletteRef.current = null;
+      segLabelsRef.current = null;
+      segLabelsOrigRef.current = null;
+      segDimsRef.current = null;
 
       drawBaseAndSnapshot(img, cw, ch, c);
+      buildEffectiveLevels();
       renderPipeline({ withSegmentation: false });
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "Ошибка оптимизации");
@@ -669,44 +456,96 @@ export default function AdminPanel({
     }
   }
 
-  async function runSegmentation() {
-    const base = baseImageDataRef.current;
+  // ===== ОПТИМИЗАЦИЯ СЕГМЕНТАЦИИ (п.3.2 — заменили полностью) =====
+  async function optimizeSegments() {
     const c = canvasRef.current;
-    if (!base || !c) return;
+    const dims = segDimsRef.current;
+    if (!c || !baseImageDataRef.current || !segPaletteRef.current || !dims) return;
 
-    setSegBusy(true);
     setErr("");
+    setInfo("");
+    setBusy(true);
     try {
-      const t0 = performance.now();
-      const { palette, labels } = uniformQuantize(base.data, base.width, base.height, k);
-      const t1 = performance.now();
+      const { w: smallW, h: smallH } = dims;
 
-      segPaletteRef.current = palette;
-      segLabelsRef.current = labels;
+      // шаг отверстий на «малой» сетке
+      const pitchPxFull = HOLE_PITCH_MM * PREVIEW_PX_PER_MM;
+      const scaleToSmall = smallW / c.width; // тот же масштаб, что при buildEffectiveLevels
+      const pitchPxSmall = Math.max(1, pitchPxFull * scaleToSmall);
+
+      // минимальная площадь на «малой» сетке
+      const minPxSmall = Math.max(4, Math.round(minAreaFactor * pitchPxSmall * pitchPxSmall));
+
+      // всегда берём исходную карту (на текущем эффективном уровне)
+      const inputLabels = segLabelsOrigRef.current ?? segLabelsRef.current!;
+      const newSmallLabels = performOptimization(
+        inputLabels,
+        smallW,
+        smallH,
+        minPxSmall,
+        segPaletteRef.current,
+        pitchPxSmall
+      );
+
+      segLabelsRef.current = newSmallLabels;
       setSegReady(true);
-
       renderPipeline({ withSegmentation: true });
-      setInfo(`Сегментация: K≈${k}, ${Math.round(t1 - t0)} мс • ${base.width}×${base.height}px`);
+
+      setInfo(`Оптимизация: коэффициент ×${minAreaFactor.toFixed(2)} • min≈${minPxSmall} (small grid)`);
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "Ошибка сегментации");
+      setErr(e instanceof Error ? e.message : "Ошибка оптимизации");
     } finally {
-      setSegBusy(false);
+      setBusy(false);
     }
   }
 
-  // при изменении K — автообновить, если уже есть база
+  // авто-оптимизация при изменении коэффициента minAreaFactor
   useEffect(() => {
-    if (!baseImageDataRef.current) return;
-    const id = window.setTimeout(() => runSegmentation(), 200);
+    if (!segReady || !segPaletteRef.current || !(segLabelsRef.current || segLabelsOrigRef.current)) return;
+    const id = window.setTimeout(() => { optimizeSegments(); }, 120);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [k]);
+  }, [minAreaFactor, effIdx]);
 
-  // переключалки (сетка/границы) — просто перерисовать
+  // общий пайплайн отрисовки
+  const renderPipeline = useCallback(({ withSegmentation }: { withSegmentation: boolean }) => {
+    const c = canvasRef.current;
+    const base = baseImageDataRef.current;
+    if (!c || !base) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+
+    // чистая база
+    ctx.putImageData(base, 0, 0);
+
+    // квантованная картинка (через «малую» сетку -> масштабирование до canvas)
+    if (withSegmentation && segPaletteRef.current && segLabelsRef.current && segDimsRef.current) {
+      const { w: smallW, h: smallH } = segDimsRef.current;
+      renderQuantizedScaled(segPaletteRef.current, segLabelsRef.current, smallW, smallH, c);
+    }
+
+    // контуры
+    if (withSegmentation && showEdges && segLabelsRef.current && segDimsRef.current) {
+      const { w: smallW, h: smallH } = segDimsRef.current;
+      renderEdgesScaled(segLabelsRef.current, smallW, smallH, c);
+    }
+
+    // сетка — в самом конце
+    if (showGrid) drawGridOverlay(c);
+  }, [showEdges, showGrid]);
+  // Автоперерисовка при смене флагов/готовности
   useEffect(() => {
     renderPipeline({ withSegmentation: segReady });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showGrid, showEdges, segReady]);
+  }, [renderPipeline, segReady]);
+
+
+  // подхватываем существующий target в инпуты
+  useEffect(() => {
+    if (target) {
+      setW(Number.isFinite(target.width) ? target.width : "");
+      setH(Number.isFinite(target.height) ? target.height : "");
+    }
+  }, [target]);
 
   const finalDims = optDims ?? (validDims ? { width: w as number, height: h as number } : null);
 
@@ -772,7 +611,7 @@ export default function AdminPanel({
           </button>
 
           <label className="ml-2 flex items-center gap-2 text-sm select-none">
-            <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />
+            <input type="checkbox" checked={showGrid} onChange={(e) => { setShowGrid(e.target.checked); renderPipeline({ withSegmentation: segReady }); }} />
             Показать сетку
           </label>
 
@@ -791,33 +630,75 @@ export default function AdminPanel({
         {!!info && <div className="text-xs text-amber-600">{info}</div>}
       </div>
 
-      {/* Сегментация */}
+      {/* Сегментация (адаптивные уровни) */}
       <div className="space-y-2">
         <div className="flex items-center justify-between">
-          <div className="font-medium">Сегментация (равномерная квантовка)</div>
+          <div className="font-medium">Сегментация (адаптивные уровни)</div>
           <label className="flex items-center gap-2 text-sm select-none">
             <input
               type="checkbox"
               checked={showEdges}
-              onChange={(e) => setShowEdges(e.target.checked)}
+              onChange={(e) => { setShowEdges(e.target.checked); renderPipeline({ withSegmentation: segReady }); }}
               disabled={!segReady}
             />
             Границы пятен
           </label>
         </div>
 
-        <div className="flex items-center gap-3">
-          <input
-            type="range"
-            min={MIN_K}
-            max={MAX_K}
-            step={1}
-            value={k}
-            onChange={(e) => setK(Number(e.target.value))}
-            className="w-64"
-            disabled={!baseImageDataRef.current}
-          />
-          <div className="text-sm tabular-nums w-28">K ≈ {k}</div>
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Слайдер выбора эффективного уровня */}
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0, effectiveLevels.length - 1)}
+              step={1}
+              value={effIdx}
+              onChange={(e) => {
+                const idx = Number(e.target.value);
+                setEffIdx(idx);
+                const cur = effectiveLevels[idx];
+                if (cur) {
+                  segPaletteRef.current = cur.palette;
+                  segLabelsRef.current = cur.labels;
+                  segLabelsOrigRef.current = cur.labels;
+                  setSegReady(true);
+                  renderPipeline({ withSegmentation: true });
+                  // применим текущую оптимизацию (если factor != 1)
+                  if (minAreaFactor !== 1.0) {
+                    const id = window.setTimeout(() => optimizeSegments(), 60);
+                    window.setTimeout(() => clearTimeout(id), 0);
+                  }
+                }
+              }}
+              className="w-64"
+              disabled={!effectiveLevels.length}
+            />
+            <div className="text-sm tabular-nums w-48">
+              {effectiveLevels.length
+                ? <>L = <b>{effectiveLevels[effIdx]?.L}</b> &nbsp;•&nbsp; K ≈ {effectiveLevels[effIdx]?.K}</>
+                : "…строю уровни"}
+            </div>
+          </div>
+
+          {/* Слайдер минимальной площади */}
+          <div className="flex items-center gap-2">
+            <label className="text-sm whitespace-nowrap">Мин. площадь</label>
+            <input
+              type="range"
+              min={0.25}
+              max={10}
+              step={0.25}
+              value={minAreaFactor}
+              onChange={(e) => setMinAreaFactor(Number(e.target.value))}
+              className="w-56"
+              disabled={!segReady}
+              title="Коэффициент к площади клетки (8×8 мм) в пикселях малой сетки"
+            />
+            <div className="text-sm tabular-nums w-20 text-right">
+              × {minAreaFactor.toFixed(2)}
+            </div>
+          </div>
 
           <button
             className="px-3 py-1 border rounded disabled:opacity-50"
